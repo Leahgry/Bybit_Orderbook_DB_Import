@@ -7,7 +7,22 @@ for batch import operations.
 
 import asyncpg
 import os
+from pathlib import Path
 from typing import Optional
+
+try:
+    from dotenv import load_dotenv
+    # Load .env from project root or current directory
+    env_paths = [
+        Path(__file__).parent.parent / '.env',  # Project root
+        Path.cwd() / '.env',                     # Current directory
+    ]
+    for env_path in env_paths:
+        if env_path.exists():
+            load_dotenv(env_path)
+            break
+except ImportError:
+    pass  # dotenv not installed, use environment variables directly
 
 
 class DatabaseConnectionManager:
