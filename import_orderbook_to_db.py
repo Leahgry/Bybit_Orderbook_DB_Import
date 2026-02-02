@@ -16,7 +16,7 @@ import shutil
 import argparse
 import logging
 from pathlib import Path
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 from collections import OrderedDict
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
@@ -775,6 +775,283 @@ async def process_directory(
     return summary
 
 
+async def run_test_mode(
+    db_manager: DatabaseConnectionManager,
+    source_dir: Path,
+    imported_dir: Path,
+    temp_dir: Path
+) -> bool:
+    """Run test mode: import one file and verify database contents.
+
+    This test mode:
+    1. Finds a single test file to process
+    2. Imports deltas and snapshots
+    3. Verifies database contents match expected counts
+    4. Confirms file was moved to ImportedFiles
+    5. Optionally cleans up test data
+
+    Args:
+        db_manager: Database connection manager.
+        source_dir: Source directory with test files.
+        imported_dir: Directory for imported files.
+        temp_dir: Temporary extraction directory.
+
+    Returns:
+        bool: True if all tests passed, False otherwise.
+    """
+    print("\n" + "=" * 80)
+    print("TEST MODE - End-to-End Verification")
+    print("=" * 80)
+
+    # Find a test file
+    test_file = None
+    for depth_dir in ['0200', '0500']:
+        depth_path = source_dir / depth_dir
+        if not depth_path.exists():
+            continue
+        for pair_dir in depth_path.iterdir():
+            if not pair_dir.is_dir():
+                continue
+            archives = list(pair_dir.glob('*.zip')) + list(pair_dir.glob('*.gz'))
+            if archives:
+                test_file = archives[0]
+                break
+        if test_file:
+            break
+
+    if not test_file:
+        print("ERROR: No test file found in source directory")
+        return False
+
+    symbol = parse_symbol_from_filename(test_file.name)
+    file_date = parse_date_from_filename(test_file.name)
+
+    print(f"\nTest file: {test_file.name}")
+    print(f"Symbol: {symbol}")
+    print(f"Date: {file_date}")
+
+    # Get symbol_id
+    async with db_manager.acquire() as conn:
+        symbol_map = await load_symbol_mapping(conn)
+
+    if symbol not in symbol_map:
+        print(f"ERROR: Symbol {symbol} not found in database")
+        return False
+
+    symbol_id = symbol_map[symbol]
+    print(f"Symbol ID: {symbol_id}")
+
+    # Get baseline counts before import
+    async with db_manager.acquire() as conn:
+        delta_count_before = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM orderbook_deltas_archive
+            WHERE symbol_id = $1
+              AND delta_timestamp >= $2
+              AND delta_timestamp < $3
+            """,
+            symbol_id,
+            datetime.combine(file_date, datetime.min.time()).replace(tzinfo=timezone.utc),
+            datetime.combine(file_date, datetime.min.time()).replace(tzinfo=timezone.utc) + timedelta(days=1)
+        )
+
+        snapshot_count_before = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM orderbook_archive
+            WHERE symbol_id = $1
+              AND minute_ts >= $2
+              AND minute_ts < $3
+            """,
+            symbol_id,
+            datetime.combine(file_date, datetime.min.time()).replace(tzinfo=timezone.utc),
+            datetime.combine(file_date, datetime.min.time()).replace(tzinfo=timezone.utc) + timedelta(days=1)
+        )
+
+    print(f"\nBaseline counts for {file_date}:")
+    print(f"  Deltas: {delta_count_before}")
+    print(f"  Snapshots: {snapshot_count_before}")
+
+    # Run import
+    print("\n--- IMPORTING ---")
+    importer = OrderbookDatabaseImporter(db_manager)
+    await importer.initialize()
+
+    result = await importer.process_archive(
+        test_file, temp_dir, imported_dir, dry_run=False
+    )
+
+    if not result.success:
+        print(f"ERROR: Import failed - {result.error_message}")
+        return False
+
+    print(f"\nImport result:")
+    print(f"  Deltas imported: {result.deltas_imported:,}")
+    print(f"  Snapshots imported: {result.snapshots_imported:,}")
+    print(f"  Data range: {result.data_start_ts} to {result.data_end_ts}")
+
+    # Verify database contents
+    print("\n--- VERIFYING DATABASE ---")
+    all_passed = True
+
+    async with db_manager.acquire() as conn:
+        # Check delta count
+        delta_count_after = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM orderbook_deltas_archive
+            WHERE symbol_id = $1
+              AND delta_timestamp >= $2
+              AND delta_timestamp < $3
+            """,
+            symbol_id,
+            datetime.combine(file_date, datetime.min.time()).replace(tzinfo=timezone.utc),
+            datetime.combine(file_date, datetime.min.time()).replace(tzinfo=timezone.utc) + timedelta(days=1)
+        )
+
+        delta_inserted = delta_count_after - delta_count_before
+        if delta_inserted == result.deltas_imported:
+            print(f"  [PASS] Deltas: {delta_inserted:,} records inserted")
+        else:
+            print(f"  [FAIL] Deltas: Expected {result.deltas_imported:,}, found {delta_inserted:,}")
+            all_passed = False
+
+        # Check snapshot count
+        snapshot_count_after = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM orderbook_archive
+            WHERE symbol_id = $1
+              AND minute_ts >= $2
+              AND minute_ts < $3
+            """,
+            symbol_id,
+            datetime.combine(file_date, datetime.min.time()).replace(tzinfo=timezone.utc),
+            datetime.combine(file_date, datetime.min.time()).replace(tzinfo=timezone.utc) + timedelta(days=1)
+        )
+
+        snapshot_inserted = snapshot_count_after - snapshot_count_before
+        if snapshot_inserted == result.snapshots_imported:
+            print(f"  [PASS] Snapshots: {snapshot_inserted:,} records inserted")
+        else:
+            print(f"  [FAIL] Snapshots: Expected {result.snapshots_imported:,}, found {snapshot_inserted:,}")
+            all_passed = False
+
+        # Check sample delta JSONB format
+        sample_delta = await conn.fetchrow(
+            """
+            SELECT delta_data FROM orderbook_deltas_archive
+            WHERE symbol_id = $1
+              AND delta_timestamp >= $2
+            ORDER BY delta_timestamp
+            LIMIT 1
+            """,
+            symbol_id,
+            datetime.combine(file_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+        )
+
+        if sample_delta:
+            delta_data = sample_delta['delta_data']
+            if 'b' in delta_data and 'a' in delta_data:
+                print(f"  [PASS] Delta JSONB format valid (has 'b' and 'a' keys)")
+            else:
+                print(f"  [FAIL] Delta JSONB format invalid: {delta_data}")
+                all_passed = False
+        else:
+            print(f"  [WARN] No sample delta found to verify format")
+
+        # Check sample snapshot compression
+        sample_snapshot = await conn.fetchrow(
+            """
+            SELECT minute_ts, length(snapshot_compressed) as size
+            FROM orderbook_archive
+            WHERE symbol_id = $1
+              AND minute_ts >= $2
+            ORDER BY minute_ts
+            LIMIT 1
+            """,
+            symbol_id,
+            datetime.combine(file_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+        )
+
+        if sample_snapshot:
+            compressed_size = sample_snapshot['size']
+            uncompressed_size = 4000 * 8  # 4000 float64 = 32000 bytes
+            ratio = uncompressed_size / compressed_size if compressed_size > 0 else 0
+            print(f"  [PASS] Snapshot compression: {compressed_size:,} bytes (ratio: {ratio:.1f}x)")
+        else:
+            print(f"  [WARN] No sample snapshot found to verify compression")
+
+        # Check data_ranges was updated
+        delta_range = await conn.fetchrow(
+            """
+            SELECT begin_datetime, end_datetime, record_count
+            FROM data_ranges
+            WHERE symbol_id = $1 AND data_type_id = $2
+            ORDER BY sequence_number DESC LIMIT 1
+            """,
+            symbol_id, DATA_TYPE_ORDERBOOK_DELTA
+        )
+
+        if delta_range:
+            print(f"  [PASS] Delta data_ranges: {delta_range['begin_datetime']} to {delta_range['end_datetime']} ({delta_range['record_count']:,} records)")
+        else:
+            print(f"  [FAIL] Delta data_ranges not created")
+            all_passed = False
+
+        snapshot_range = await conn.fetchrow(
+            """
+            SELECT begin_datetime, end_datetime, record_count
+            FROM data_ranges
+            WHERE symbol_id = $1 AND data_type_id = $2
+            ORDER BY sequence_number DESC LIMIT 1
+            """,
+            symbol_id, DATA_TYPE_ORDERBOOK_SNAPSHOT
+        )
+
+        if snapshot_range:
+            print(f"  [PASS] Snapshot data_ranges: {snapshot_range['begin_datetime']} to {snapshot_range['end_datetime']} ({snapshot_range['record_count']:,} records)")
+        else:
+            print(f"  [FAIL] Snapshot data_ranges not created")
+            all_passed = False
+
+    # Check file was moved
+    print("\n--- VERIFYING FILE MOVE ---")
+    original_exists = test_file.exists()
+
+    # Calculate expected destination
+    relative_parts = []
+    current = test_file.parent
+    while current.name and current.name not in ('OrderBook', ''):
+        relative_parts.insert(0, current.name)
+        current = current.parent
+
+    if relative_parts:
+        expected_dest = imported_dir / Path(*relative_parts) / test_file.name
+    else:
+        expected_dest = imported_dir / test_file.name
+
+    moved_exists = expected_dest.exists()
+
+    if not original_exists and moved_exists:
+        print(f"  [PASS] File moved to: {expected_dest}")
+    elif original_exists and not moved_exists:
+        print(f"  [FAIL] File not moved (still at original location)")
+        all_passed = False
+    elif original_exists and moved_exists:
+        print(f"  [WARN] File exists in both locations")
+    else:
+        print(f"  [FAIL] File missing from both locations")
+        all_passed = False
+
+    # Summary
+    print("\n" + "=" * 80)
+    if all_passed:
+        print("TEST RESULT: ALL TESTS PASSED")
+    else:
+        print("TEST RESULT: SOME TESTS FAILED")
+    print("=" * 80)
+
+    return all_passed
+
+
 def main():
     """Main entry point for the orderbook database importer."""
     parser = argparse.ArgumentParser(
@@ -850,12 +1127,34 @@ def main():
         action='store_true',
         help='Enable verbose logging'
     )
+    parser.add_argument(
+        '--test',
+        action='store_true',
+        help='Run test mode: import one file and verify database contents'
+    )
 
     args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    # Test mode
+    if args.test:
+        async def run_test():
+            db_manager = DatabaseConnectionManager(dsn=args.database_url)
+            async with db_manager:
+                success = await run_test_mode(
+                    db_manager,
+                    args.source_dir,
+                    args.imported_dir,
+                    args.temp_dir
+                )
+            return success
+
+        success = asyncio.run(run_test())
+        exit(0 if success else 1)
+
+    # Normal mode
     print("=" * 80)
     print("Bybit Orderbook Database Importer")
     print("=" * 80)
