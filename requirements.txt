@@ -1,0 +1,36 @@
+# Bybit Orderbook Database Importer
+# Python 3.9+ required
+
+# =============================================================================
+# REQUIRED DEPENDENCIES
+# =============================================================================
+
+# PostgreSQL async driver for database operations
+asyncpg>=0.29.0
+
+# Numerical operations for snapshot array compression
+numpy>=1.21.0
+
+# =============================================================================
+# OPTIONAL DEPENDENCIES
+# =============================================================================
+
+# Environment variable support for database credentials
+python-dotenv>=1.0.0
+
+# =============================================================================
+# STANDARD LIBRARY MODULES (no installation needed)
+# =============================================================================
+# - asyncio
+# - json
+# - zlib
+# - gzip
+# - zipfile
+# - shutil
+# - argparse
+# - datetime
+# - pathlib
+# - logging
+# - dataclasses
+# - collections
+# - typing

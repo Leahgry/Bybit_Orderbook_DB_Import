@@ -1,0 +1,37 @@
+# Test outputs
+test_output/
+test_temp/
+test_source_condensed/
+test_output_condensed/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Extracted test files
+*.data
+!*.data.zip
+
